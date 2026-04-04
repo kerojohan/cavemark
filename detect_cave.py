@@ -475,6 +475,76 @@ def compute_valid_region(gray_f32):
 # 4. GENERATE CANDIDATES
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _snap_lower_contour(mask, depth_norm, search_up=15, search_down=40,
+                        smooth_window=25):
+    """Snap the lower contour of mask to the strongest depth-gradient edge.
+
+    Adapted from bat_tracker.valid_region._snap_lower_contour_to_depth_gradient.
+    Uses Sobel-Y on the inverted depth map to locate the natural transition
+    between the cave void (deep) and surrounding rock (near).  The per-column
+    snapped positions are smoothed with a moving average so the final boundary
+    is continuous rather than jagged.
+
+    Args:
+        mask:        uint8 binary mask of the selected region.
+        depth_norm:  float32 ensemble depth (0=cave/deep, 1=near/surface).
+        search_up:   pixels above the current bottom to search for a gradient edge.
+        search_down: pixels below the current bottom to search for a gradient edge.
+        smooth_window: moving-average window for contour smoothing (odd).
+
+    Returns:
+        Refined uint8 mask with the lower boundary snapped to the gradient edge.
+    """
+    h, w = mask.shape
+    # Convert to "brightness = depth" convention so edges align with dark→light
+    depth_u8 = np.clip((1.0 - depth_norm) * 255, 0, 255).astype(np.uint8)
+    grad_y = cv2.Sobel(depth_u8.astype(np.float32), cv2.CV_32F, 0, 1, ksize=3)
+    abs_grad_y = np.abs(grad_y)
+    global_thr = float(np.percentile(abs_grad_y, 60))
+
+    xs, tops, new_bottoms = [], [], []
+    for x in range(w):
+        col_ys = np.where(mask[:, x] > 0)[0]
+        if col_ys.size == 0:
+            continue
+        top    = int(col_ys.min())
+        bottom = int(col_ys.max())
+        y0 = max(top, bottom - search_up)
+        y1 = min(h - 1, bottom + search_down)
+        if y1 > y0:
+            col_grad = abs_grad_y[y0:y1 + 1, x]
+            best_local = int(np.argmax(col_grad))
+            best_y = int(y0 + best_local)
+            # Only move to snapped edge if there is a genuinely strong gradient
+            if float(abs_grad_y[best_y, x]) >= global_thr:
+                best_y = int(np.clip(best_y, top + 1, h - 1))
+            else:
+                best_y = bottom
+        else:
+            best_y = bottom
+        xs.append(x)
+        tops.append(top)
+        new_bottoms.append(best_y)
+
+    if not xs:
+        return mask
+
+    # Smooth snapped bottom path to avoid column-level noise
+    win = smooth_window if smooth_window % 2 == 1 else smooth_window + 1
+    bottoms_arr = np.array(new_bottoms, dtype=np.float32)
+    pad = win // 2
+    padded = np.pad(bottoms_arr, (pad, pad), mode="edge")
+    kernel = np.ones(win, dtype=np.float32) / win
+    smoothed = np.rint(np.convolve(padded, kernel, mode="valid")).astype(np.int32)
+
+    refined = np.zeros_like(mask, dtype=np.uint8)
+    for i, x in enumerate(xs):
+        t = tops[i]
+        b = int(np.clip(smoothed[i], t + 1, h - 1))
+        refined[t:b + 1, x] = 255
+    return refined
+
+
 def _extract_components(binary, min_area):
     """Extract connected components ≥ min_area after morphological cleaning."""
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
@@ -648,6 +718,58 @@ def generate_candidates(proc, gray_f32, h, w, left_col=0, right_col=None,
         # Only keep if the enclosed region is predominantly dark
         if interior_mean < 110:  # < ~0.43 on [0,1]
             candidates.append(cand_h)
+
+    # ── J. Central dark layer (bat_tracker-inspired) ─────────────────────────
+    # Seed from the most centrally-located deep region and grow outward through
+    # progressively lighter depth layers.  Unlike A–H which threshold the full
+    # image, this preserves spatial coherence: a dark isolated patch far from
+    # the image centre (vegetation corner, shadow) is deprioritised in favour of
+    # the topologically central dark component — which corresponds to the cave
+    # entrance in the typical trail-camera framing.
+    # Uses depth_norm when available (DA2-backed); falls back to inverted grey.
+    _jdm = (1.0 - depth_norm) if depth_norm is not None else (1.0 - gray_f32)
+    _jk  = max(11, int(min(h, w) * 0.08) | 1)
+    _jdm_s = cv2.GaussianBlur((_jdm * 255).astype(np.float32), (_jk, _jk), 0)
+    # Seed: deepest 15 % of the depth map
+    _jthr = float(np.percentile(_jdm_s, 85))
+    _jseed = np.where(_jdm_s >= _jthr, 255, 0).astype(np.uint8)
+    _jmk = max(9, int(min(h, w) * 0.015) | 1)
+    _jel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_jmk, _jmk))
+    _jseed = cv2.morphologyEx(_jseed, cv2.MORPH_OPEN, _jel)
+    _jseed = cv2.morphologyEx(_jseed, cv2.MORPH_CLOSE, _jel)
+    _jn, _jlbl, _jst, _ = cv2.connectedComponentsWithStats(_jseed, 8)
+    if _jn > 1:
+        _jmin = max(min_area, int(h * w * 0.02))
+        _jcx, _jcy = w // 2, h // 2
+        _jcl = int(_jlbl[_jcy, _jcx])
+        _jsel = 0
+        if _jcl > 0 and int(_jst[_jcl, cv2.CC_STAT_AREA]) >= _jmin:
+            _jsel = _jcl
+        else:
+            _jbest = float("inf")
+            for _li in range(1, _jn):
+                if int(_jst[_li, cv2.CC_STAT_AREA]) < max(1, _jmin):
+                    continue
+                _lcx = int(_jst[_li, cv2.CC_STAT_LEFT]) + int(_jst[_li, cv2.CC_STAT_WIDTH]) / 2.0
+                _ld = abs(_lcx - _jcx)
+                if _ld < _jbest:
+                    _jbest = _ld
+                    _jsel = _li
+        if _jsel <= 0:
+            _jsel = 1 + int(np.argmax(_jst[1:, cv2.CC_STAT_AREA]))
+        _jmask = np.where(_jlbl == _jsel, 255, 0).astype(np.uint8)
+        # Expand through progressively lighter depth layers
+        _jexp = _jmask.copy()
+        for _jpct, _jdpx in [(75, max(8,  int(min(h, w) * 0.015))),
+                              (60, max(15, int(min(h, w) * 0.025)))]:
+            _jlayer_thr = float(np.percentile(_jdm_s, _jpct))
+            _jlayer = np.where(_jdm_s >= _jlayer_thr, 255, 0).astype(np.uint8)
+            _jdk = 2 * _jdpx + 1
+            _jdel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_jdk, _jdk))
+            _jdil = cv2.dilate(_jexp, _jdel)
+            _jexp[(_jdil > 0) & (_jlayer > 0)] = 255
+        candidates += _extract_components(_jexp, min_area)
+        candidates += _extract_components_heavy(_jexp, min_area, h, w)
 
     # ── Deduplicate (IoU > 0.80) ──────────────────────────────────────────────
     unique = []
@@ -1421,6 +1543,19 @@ def process_image(input_path, output_dir):
     post_gc_frac = np.count_nonzero(best_mask) / (h * w)
     if abs(post_gc_frac - pre_gc_frac) > 0.005:
         print(f"  [{bn}] grabcut {pre_gc_frac*100:.1f}% → {post_gc_frac*100:.1f}%")
+
+    # ── Bottom contour snapping (bat_tracker-inspired) ────────────────────────
+    # Snap the lower boundary of the mask to the strongest depth-gradient edge
+    # using Sobel-Y analysis followed by moving-average smoothing.  This gives a
+    # physically-grounded lower boundary (the rock-to-void transition) rather
+    # than an arbitrary threshold level.  Only applied when the depth ensemble
+    # is available and the result stays within 50 % of the current mask size.
+    if depth_norm is not None and np.count_nonzero(best_mask) > 100:
+        snapped = _snap_lower_contour(best_mask, depth_norm)
+        snap_frac = np.count_nonzero(snapped) / (h * w)
+        mask_frac = np.count_nonzero(best_mask) / (h * w)
+        if 0.50 * mask_frac <= snap_frac <= 1.50 * mask_frac and snap_frac > 0.002:
+            best_mask = snapped
 
     refined = refine_mask(best_mask, gray_f32)
     draw_result(gray_u8, refined, scores,
