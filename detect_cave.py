@@ -1428,7 +1428,7 @@ def process_image(input_path, output_dir):
     if scores.get("solidity", 1.0) < 0.65 and np.count_nonzero(best_mask) > 100:
         _is_dark_void = scores.get("mean_inside", 1.0) < 0.15
         mask_weights = wmap[best_mask > 0]
-        w_thresh = np.percentile(mask_weights, 30 if _is_dark_void else 60)
+        w_thresh = np.percentile(mask_weights, 50 if _is_dark_void else 60)
         high_w = ((best_mask > 0) & (wmap >= w_thresh)).astype(np.uint8) * 255
         # Clean and extract connected components
         sk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
