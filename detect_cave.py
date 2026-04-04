@@ -3,15 +3,16 @@
 detect_cave.py — Automatic cave entrance detector for IR/NIR imagery.
 
 Usage:
-    python detect_cave.py input.jpg output.jpg
-    python detect_cave.py           # batch mode: processes all jpg/png in current dir
+    python detect_cave.py                      # batch: all jpg/png in current dir
+    python detect_cave.py img1.png img2.png    # specific images
 
-v3 — Redesigned pipeline:
-  - Iterative flood-fill growth from darkest seeds for better candidate shapes
-  - Heavy morphological bridging to connect fragmented dark areas
-  - Dark-mass scoring (area × darkness) to prefer large dark regions
-  - Darkest-pixel containment to identify the main cavity
-  - Sharp penalties for both tiny and enormous candidates
+v4 — Improved pipeline (opencv + numpy only, no external models):
+  - IR physics depth map (darkness × multi-scale local uniformity) as new signal
+  - Texture gate: penalises textured rock/vegetation masquerading as voids
+  - Vertical centroid gate: suppresses top-of-frame artefacts
+  - GrabCut boundary refinement after candidate selection
+  - Contour smoothing in refine_mask (wrap-around Gaussian)
+  - Amber dilation ring in result visualisation
 """
 
 import cv2
@@ -122,7 +123,35 @@ def compute_valid_region(gray_f32):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 4. GENERATE CANDIDATES
+# 4. IR PHYSICS DEPTH
+# ──────────────────────────────────────────────────────────────────────────────
+
+def compute_ir_depth(gray_f32):
+    """
+    Fast IR physics depth map: darkness × local_uniformity at 3 scales.
+
+    Cave voids absorb all IR → near-black AND very uniform.
+    Textured surfaces (rock, vegetation) can appear dark but non-uniform.
+    Returns a depth map in [0..1]; higher = more likely to be a deep cavity.
+    """
+    h, w = gray_f32.shape
+    darkness = 1.0 - gray_f32
+    depths = []
+    for base_k in [15, 31, 61]:
+        ksize = max(3, min(base_k, min(h, w) // 3) | 1)
+        mean_l  = cv2.GaussianBlur(gray_f32, (ksize, ksize), 0)
+        mean_sq = cv2.GaussianBlur(gray_f32 * gray_f32, (ksize, ksize), 0)
+        var_l   = np.clip(mean_sq - mean_l * mean_l, 0.0, None)
+        std_l   = np.sqrt(var_l)
+        # uniformity: 1 when perfectly uniform, drops toward 0 with high relative std
+        denom      = np.clip(mean_l + 0.05, 0.05, None)
+        uniformity = 1.0 - np.clip(std_l / denom, 0.0, 1.0)
+        depths.append(darkness * uniformity)
+    return np.mean(depths, axis=0).astype(np.float32)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 5. GENERATE CANDIDATES
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _extract_components(binary, min_area):
@@ -141,12 +170,10 @@ def _extract_components(binary, min_area):
 def _extract_components_heavy(binary, min_area, h, w):
     """Extract components with HEAVY morphological bridging (large closing).
     Bridges fragmented dark spots that belong to the same cave entrance."""
-    # Large closing to bridge gaps
     close_size = max(15, int(min(h, w) * 0.04) | 1)
     close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
                                          (close_size, close_size))
     bridged = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, close_k)
-    # Standard cleanup
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
     bridged = cv2.morphologyEx(bridged, cv2.MORPH_OPEN, k)
     n, labels, stats, _ = cv2.connectedComponentsWithStats(bridged, 8)
@@ -163,8 +190,9 @@ def generate_candidates(proc, gray_f32, h, w, left_col=0, right_col=None):
       A. Multi-level thresholding with standard cleaning
       B. Multi-level thresholding with heavy bridging
       C. Iterative seed-growth from darkest pixels
-      D. Otsu
-      E. Adaptive threshold intersected with dark base
+      D. Otsu thresholding
+      E. Adaptive threshold intersected with a dark base
+      F. Valid-zone-only masking (lateral shadows masked out)
     """
     denoised     = proc["denoised"]
     corrected_u8 = proc["corrected_u8"]
@@ -185,18 +213,14 @@ def generate_candidates(proc, gray_f32, h, w, left_col=0, right_col=None):
         candidates += _extract_components(binary, min_area)
 
     # ── B. Multi-level with HEAVY bridging ────────────────────────────────────
-    # This connects fragmented dark spots that form one physical entrance
     for pct in [10, 15, 20, 25, 30, 35]:
         thr = int(np.percentile(denoised, pct))
         _, binary = cv2.threshold(denoised, thr, 255, cv2.THRESH_BINARY_INV)
         candidates += _extract_components_heavy(binary, min_area, h, w)
 
     # ── C. Iterative seed-growth ──────────────────────────────────────────────
-    # Start from the darkest 1% of pixels, grow by increasing threshold.
-    # Record candidates at each growth level.
     p1 = int(np.percentile(denoised, 1))
     _, seed = cv2.threshold(denoised, max(p1, 3), 255, cv2.THRESH_BINARY_INV)
-    # Bridge the seed
     seed_k = cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE,
         (max(7, int(min(h, w) * 0.03) | 1),
@@ -204,19 +228,14 @@ def generate_candidates(proc, gray_f32, h, w, left_col=0, right_col=None):
     )
     seed = cv2.morphologyEx(seed, cv2.MORPH_CLOSE, seed_k)
 
-    # Grow at increasing thresholds
     for pct in [5, 10, 15, 20, 25, 30, 35, 40, 50]:
         thr = int(np.percentile(denoised, pct))
         _, dark_level = cv2.threshold(denoised, thr, 255, cv2.THRESH_BINARY_INV)
-        # Grow: dilate seed, then intersect with dark_level
         grow_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
         grown = cv2.dilate(seed, grow_k, iterations=2)
         grown = cv2.bitwise_and(grown, dark_level)
-        # Bridge gaps
         grown = cv2.morphologyEx(grown, cv2.MORPH_CLOSE, seed_k)
-        # Update seed for next iteration
         seed = cv2.bitwise_or(seed, grown)
-        # Record as candidate
         candidates += _extract_components(grown, min_area)
 
     # ── D. Otsu ───────────────────────────────────────────────────────────────
@@ -239,8 +258,6 @@ def generate_candidates(proc, gray_f32, h, w, left_col=0, right_col=None):
     candidates += _extract_components_heavy(combined, min_area, h, w)
 
     # ── F. Valid-zone-only thresholding ──────────────────────────────────────
-    # Mask out lateral zones (set to bright) so dark laterals don't merge
-    # with the cave entrance during connected-component extraction.
     if right_col is None:
         right_col = w - 1
     if left_col > 10 or right_col < w - 11:
@@ -248,7 +265,7 @@ def generate_candidates(proc, gray_f32, h, w, left_col=0, right_col=None):
         masked_den[:, :left_col] = 255
         masked_den[:, right_col+1:] = 255
         for pct in [10, 15, 20, 25, 30, 35, 40]:
-            thr = int(np.percentile(denoised, pct))  # percentile from FULL image
+            thr = int(np.percentile(denoised, pct))
             _, binary = cv2.threshold(masked_den, thr, 255, cv2.THRESH_BINARY_INV)
             candidates += _extract_components(binary, min_area)
             candidates += _extract_components_heavy(binary, min_area, h, w)
@@ -271,19 +288,20 @@ def generate_candidates(proc, gray_f32, h, w, left_col=0, right_col=None):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 5. SCORE A CANDIDATE
+# 6. SCORE A CANDIDATE
 # ──────────────────────────────────────────────────────────────────────────────
 
 def score_candidate(mask, gray_f32, weight_map, left_col, right_col,
-                    darkest5_mask):
+                    darkest5_mask, depth_map=None):
     """
     Multi-criteria scoring with MULTIPLICATIVE gates.
 
     Key design:
       - Contrast vs surround is the primary additive signal
-      - Darkness enrichment replaces raw containment (penalises large blobs)
-      - Area and solidity are MULTIPLICATIVE — wrong size or donut shape
-        kills the score regardless of how dark/contrasty the region is
+      - IR physics depth rewards dark AND uniform regions (true voids)
+      - Texture gate (multiplicative) penalises textured rock/vegetation
+      - Vertical gate (multiplicative) suppresses top-frame artefacts
+      - Area and solidity are MULTIPLICATIVE — wrong size/shape kills score
     """
     h, w = gray_f32.shape
     img_area = h * w
@@ -302,13 +320,14 @@ def score_candidate(mask, gray_f32, weight_map, left_col, right_col,
     hull_area = cv2.contourArea(cv2.convexHull(cnt))
     solidity = cnt_area / hull_area if hull_area > 0 else 0.0
     x, y, bw, bh = cv2.boundingRect(cnt)
-    bbox_area = bw * bh
     aspect = min(bw, bh) / max(bw, bh) if max(bw, bh) > 0 else 0.0
     area_frac = area / img_area
 
     # ── Intensity ─────────────────────────────────────────────────────────────
-    mean_inside = float(gray_f32[mask_bool].mean())
-    darkness = 1.0 - mean_inside
+    vals_inside = gray_f32[mask_bool]
+    mean_inside = float(vals_inside.mean())
+    std_inside  = float(vals_inside.std())
+    darkness    = 1.0 - mean_inside
 
     # ── 1. Contrast vs wide surround (ADDITIVE, primary) ─────────────────────
     ring_width = max(40, int(min(h, w) * 0.08))
@@ -327,7 +346,6 @@ def score_candidate(mask, gray_f32, weight_map, left_col, right_col,
     dark_score = np.clip(darkness / 0.7, 0.0, 1.0)
 
     # ── 3. Darkness enrichment (ADDITIVE) ─────────────────────────────────────
-    # enrichment = (frac_of_darkest_inside / area_frac)
     darkest5_bool = darkest5_mask.astype(bool)
     total_darkest = max(darkest5_bool.sum(), 1)
     contained_frac = float((mask_bool & darkest5_bool).sum()) / total_darkest
@@ -335,14 +353,19 @@ def score_candidate(mask, gray_f32, weight_map, left_col, right_col,
     enrichment_score = np.clip((enrichment - 1.0) / 8.0, 0.0, 1.0)
 
     # ── 4. Distance-transform depth (ADDITIVE) ───────────────────────────────
-    # Measures how thick/deep the darkest core is.  Large coherent voids
-    # have high max-distance; narrow shadows or elongated strips don't.
     dist_transform = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
     max_dist = float(dist_transform.max())
-    ref_dist = min(h, w) * 0.12   # reference: 12% of min dimension
+    ref_dist = min(h, w) * 0.12
     depth_score = np.clip(max_dist / ref_dist, 0.0, 1.0)
 
-    # ── 5. Boundary gradient (ADDITIVE) ───────────────────────────────────────
+    # ── 5. IR physics depth (ADDITIVE) ────────────────────────────────────────
+    # Cave voids are dark AND spatially uniform; textured surfaces score lower
+    if depth_map is not None:
+        ir_depth_score = float(np.clip(depth_map[mask_bool].mean() / 0.5, 0.0, 1.0))
+    else:
+        ir_depth_score = dark_score * 0.5   # fallback without depth map
+
+    # ── 6. Boundary gradient (ADDITIVE) ───────────────────────────────────────
     grad_x = cv2.Sobel(gray_f32, cv2.CV_32F, 1, 0, ksize=5)
     grad_y = cv2.Sobel(gray_f32, cv2.CV_32F, 0, 1, ksize=5)
     grad_mag = np.sqrt(grad_x**2 + grad_y**2)
@@ -355,13 +378,13 @@ def score_candidate(mask, gray_f32, weight_map, left_col, right_col,
     else:
         gradient_score = 0.0
 
-    # ── 5. Valid region alignment (ADDITIVE) ──────────────────────────────────
+    # ── 7. Valid region alignment (ADDITIVE) ──────────────────────────────────
     valid_score = float(weight_map[mask_bool].mean())
 
-    # ── 6. Aspect ratio (ADDITIVE) ────────────────────────────────────────────
+    # ── 8. Aspect ratio (ADDITIVE) ────────────────────────────────────────────
     aspect_score = 1.0 if aspect >= 0.15 else aspect / 0.15
 
-    # ── 7. Position (ADDITIVE, very mild centre bias) ─────────────────────────
+    # ── 9. Position (ADDITIVE, very mild centre bias) ─────────────────────────
     cx = x + bw / 2.0
     cy = y + bh / 2.0
     dist_x = abs(cx / w - 0.5) * 2
@@ -369,37 +392,39 @@ def score_candidate(mask, gray_f32, weight_map, left_col, right_col,
     position_score = 1.0 - 0.10 * dist_x - 0.05 * dist_y
 
     # ── Additive base score ───────────────────────────────────────────────────
+    # Weights sum to 1.0:
+    # 0.24+0.14+0.06+0.12+0.10+0.09+0.06+0.03+0.04+0.12 = 1.00
     additive = (
-        0.26 * contrast_score       # most important: brightness transition
-      + 0.16 * dark_score           # raw darkness
-      + 0.08 * enrichment_score     # concentration of darkest pixels
-      + 0.16 * depth_score          # thick/deep dark core (not narrow shadow)
-      + 0.10 * gradient_score       # strong boundary edge
-      + 0.06 * valid_score          # within illuminated zone
-      + 0.04 * aspect_score         # not absurdly thin
-      + 0.04 * position_score       # mild centre preference
-      + 0.10 * 1.0                  # base
+        0.24 * contrast_score
+      + 0.14 * dark_score
+      + 0.06 * enrichment_score
+      + 0.12 * depth_score          # distance-transform depth
+      + 0.10 * ir_depth_score       # IR physics depth (darkness × uniformity)
+      + 0.09 * gradient_score
+      + 0.06 * valid_score
+      + 0.03 * aspect_score
+      + 0.04 * position_score
+      + 0.12 * 1.0                  # base
     )
 
     # ── MULTIPLICATIVE GATES ──────────────────────────────────────────────────
-    # These cannot be compensated by high additive scores.
 
-    # Area gate: 8%–35% ideal; below 8% ramps down hard.
-    # Cave entrances are substantial features, not tiny spots.
+    # Area gate: 8%–28% ideal; large blobs (>28%) are usually outdoor
+    # shadows, not cave entrances — penalise them more steeply than before.
     if area_frac < 0.005:
         area_mult = 0.05
     elif area_frac < 0.02:
-        area_mult = 0.05 + 0.15 * (area_frac - 0.005) / 0.015
+        area_mult = 0.05 + 0.20 * (area_frac - 0.005) / 0.015
     elif area_frac < 0.04:
-        area_mult = 0.20 + 0.20 * (area_frac - 0.02) / 0.02
+        area_mult = 0.25 + 0.25 * (area_frac - 0.02) / 0.02
     elif area_frac < 0.08:
-        area_mult = 0.40 + 0.60 * (area_frac - 0.04) / 0.04
-    elif area_frac <= 0.35:
+        area_mult = 0.50 + 0.50 * (area_frac - 0.04) / 0.04
+    elif area_frac <= 0.28:
         area_mult = 1.0
-    elif area_frac <= 0.50:
-        area_mult = 1.0 - 0.7 * (area_frac - 0.35) / 0.15
+    elif area_frac <= 0.45:
+        area_mult = 1.0 - 0.80 * (area_frac - 0.28) / 0.17
     else:
-        area_mult = max(0.05, 0.3 - 0.25 * (area_frac - 0.50) / 0.50)
+        area_mult = max(0.05, 0.20 - 0.15 * (area_frac - 0.45) / 0.55)
 
     # Solidity gate: very non-convex (donut, tentacles) → penalised
     if solidity >= 0.45:
@@ -409,13 +434,32 @@ def score_candidate(mask, gray_f32, weight_map, left_col, right_col,
     else:
         solidity_mult = 0.4
 
+    # Texture gate: cave voids are dark AND uniform; textured regions penalised.
+    # std_inside > 0.10 starts the ramp; above 0.22 caps at 0.60.
+    if std_inside <= 0.10:
+        texture_mult = 1.0
+    elif std_inside <= 0.22:
+        texture_mult = 1.0 - 0.40 * (std_inside - 0.10) / 0.12
+    else:
+        texture_mult = 0.60
+
+    # Vertical gate: entrances in the top quarter of the frame are unlikely.
+    # Penalises bright sky patches and illuminated ceiling artefacts.
+    if cy / h < 0.25:
+        vert_gate = 0.75
+    elif cy / h < 0.35:
+        vert_gate = 0.75 + 0.25 * (cy / h - 0.25) / 0.10
+    else:
+        vert_gate = 1.0
+
     # Lateral penalty
     lateral_pen = 1.0
     if int(cx) < left_col or int(cx) > right_col:
         if valid_score < 0.5:
             lateral_pen = 0.4
 
-    total = additive * area_mult * solidity_mult * lateral_pen
+    total = (additive * area_mult * solidity_mult
+             * texture_mult * vert_gate * lateral_pen)
 
     return {
         "total":          round(float(total), 4),
@@ -424,6 +468,10 @@ def score_candidate(mask, gray_f32, weight_map, left_col, right_col,
         "dark":           round(float(dark_score), 3),
         "enrichment":     round(float(enrichment_score), 3),
         "depth":          round(float(depth_score), 3),
+        "ir_depth":       round(float(ir_depth_score), 3),
+        "texture":        round(float(std_inside), 3),
+        "texture_mult":   round(float(texture_mult), 3),
+        "vert_gate":      round(float(vert_gate), 3),
         "area_mult":      round(float(area_mult), 3),
         "area_frac":      round(float(area_frac), 4),
         "solidity":       round(float(solidity), 3),
@@ -436,23 +484,22 @@ def score_candidate(mask, gray_f32, weight_map, left_col, right_col,
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 6. SELECT BEST
+# 7. SELECT BEST
 # ──────────────────────────────────────────────────────────────────────────────
 
 def select_best_candidate(candidates, gray_f32, weight_map,
-                          left_col, right_col):
+                          left_col, right_col, depth_map=None):
     """Score all candidates, return (best_mask, best_scores, all_scores)."""
     if not candidates:
         return None, {}, []
 
-    # Pre-compute: mask of darkest 5% of pixels in the image
     p5 = np.percentile(gray_f32, 5)
     darkest5_mask = (gray_f32 <= p5).astype(np.uint8) * 255
 
     all_scores = []
     for cand in candidates:
         sc = score_candidate(cand, gray_f32, weight_map, left_col, right_col,
-                             darkest5_mask)
+                             darkest5_mask, depth_map=depth_map)
         all_scores.append(sc)
 
     best_idx = max(range(len(all_scores)),
@@ -461,15 +508,111 @@ def select_best_candidate(candidates, gray_f32, weight_map,
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 7. REFINE MASK
+# 8. GRABCUT REFINE
+# ──────────────────────────────────────────────────────────────────────────────
+
+def grabcut_refine(gray_u8, mask, expand_ratio=2.0):
+    """
+    Refine mask boundary using GrabCut (OpenCV graph-cut, no extra deps).
+
+    Initialisation:
+      - Eroded core  → definite foreground
+      - Dilated mask → probable foreground
+      - Expanded rect area far from mask → probable background
+    """
+    h, w = gray_u8.shape
+    area = np.count_nonzero(mask)
+    if area < 200:
+        return mask
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+                                    cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return mask
+    cnt = max(contours, key=cv2.contourArea)
+    x, y, bw, bh = cv2.boundingRect(cnt)
+    if bw < 5 or bh < 5:
+        return mask
+
+    # Expand bounding rectangle
+    ex = int(bw * (expand_ratio - 1) / 2)
+    ey = int(bh * (expand_ratio - 1) / 2)
+    x1 = max(0, x - ex);  y1 = max(0, y - ey)
+    x2 = min(w, x + bw + ex);  y2 = min(h, y + bh + ey)
+    if x2 - x1 < 5 or y2 - y1 < 5:
+        return mask
+
+    gc_mask = np.full((h, w), cv2.GC_BGD, dtype=np.uint8)
+
+    # Probable FG: dilated mask clipped to expanded rect
+    dil_r = max(5, int(min(bw, bh) * 0.10))
+    dil_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*dil_r+1, 2*dil_r+1))
+    prob_fg = cv2.dilate(mask, dil_k)
+    prob_fg[:y1, :] = 0;  prob_fg[y2:, :] = 0
+    prob_fg[:, :x1] = 0;  prob_fg[:, x2:] = 0
+    gc_mask[prob_fg > 0] = cv2.GC_PR_FGD
+
+    # Definite FG: eroded core
+    ero_r = max(3, int(min(bw, bh) * 0.08))
+    ero_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*ero_r+1, 2*ero_r+1))
+    core = cv2.erode(mask, ero_k)
+    gc_mask[core > 0] = cv2.GC_FGD
+
+    # Probable BG: inside expanded rect but well away from mask
+    far_r = max(7, int(min(bw, bh) * 0.20))
+    far_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*far_r+1, 2*far_r+1))
+    far_dil = cv2.dilate(mask, far_k)
+    in_rect = np.zeros((h, w), np.uint8)
+    in_rect[y1:y2, x1:x2] = 255
+    prob_bg = cv2.bitwise_and(in_rect, cv2.bitwise_not(far_dil))
+    gc_mask[prob_bg > 0] = cv2.GC_PR_BGD
+
+    if (gc_mask == cv2.GC_FGD).sum() < 10:
+        return mask
+
+    bgd_model = np.zeros((1, 65), np.float64)
+    fgd_model = np.zeros((1, 65), np.float64)
+    rect = (x1, y1, x2 - x1, y2 - y1)
+
+    try:
+        vis3 = cv2.cvtColor(gray_u8, cv2.COLOR_GRAY2BGR)
+        cv2.grabCut(vis3, gc_mask, rect, bgd_model, fgd_model,
+                    3, cv2.GC_INIT_WITH_MASK)
+        result = np.where(
+            (gc_mask == cv2.GC_FGD) | (gc_mask == cv2.GC_PR_FGD),
+            255, 0
+        ).astype(np.uint8)
+
+        if np.count_nonzero(result) < area * 0.25:
+            return mask
+
+        # Keep the largest component that overlaps the original mask.
+        # (Guards against GrabCut fragmenting into many tiny pieces.)
+        n_comp, labels, stats, _ = cv2.connectedComponentsWithStats(result, 8)
+        if n_comp > 2:
+            overlap_ids = np.unique(labels[mask > 0])
+            overlap_ids = overlap_ids[overlap_ids != 0]
+            if len(overlap_ids) > 0:
+                keep_id = overlap_ids[
+                    np.argmax(stats[overlap_ids, cv2.CC_STAT_AREA])
+                ]
+                result = ((labels == keep_id) * 255).astype(np.uint8)
+
+        if np.count_nonzero(result) < area * 0.25:
+            return mask
+
+        return result
+
+    except Exception:
+        return mask
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 9. REFINE MASK
 # ──────────────────────────────────────────────────────────────────────────────
 
 def refine_mask(mask, gray_f32):
-    """Close gaps, fill holes, smooth boundary, keep largest component.
-
-    Uses a bordered flood-fill so it works even when the mask touches
-    the image edges or corners.
-    """
+    """Close gaps, fill holes, smooth boundary, keep largest component."""
     h, w = gray_f32.shape
     orig_area = np.count_nonzero(mask)
 
@@ -477,15 +620,12 @@ def refine_mask(mask, gray_f32):
     ck = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (cs, cs))
     refined = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, ck)
 
-    # Fill interior holes safely using a 1px black border.
-    # This guarantees the flood-fill seed is always background,
-    # even if the mask touches image edges.
+    # Fill interior holes safely using a 1-px black border.
     bordered = np.zeros((h + 2, w + 2), np.uint8)
     bordered[1:-1, 1:-1] = refined
     flood = bordered.copy()
     pad = np.zeros((h + 4, w + 4), np.uint8)
     cv2.floodFill(flood, pad, (0, 0), 255)
-    # Interior holes are pixels that stayed 0 (not reachable from border)
     holes = cv2.bitwise_not(flood)[1:-1, 1:-1]
     refined = cv2.bitwise_or(refined, holes)
 
@@ -500,16 +640,40 @@ def refine_mask(mask, gray_f32):
         largest = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
         refined = ((labels == largest) * 255).astype(np.uint8)
 
-    # Safety: if refinement bloated the mask beyond 2× original, revert
-    refined_area = np.count_nonzero(refined)
-    if refined_area > max(orig_area * 2, h * w * 0.50):
+    # ── Contour smoothing (wrap-around Gaussian) ──────────────────────────────
+    cnts, _ = cv2.findContours(refined, cv2.RETR_EXTERNAL,
+                                cv2.CHAIN_APPROX_NONE)
+    if cnts:
+        main_cnt = max(cnts, key=cv2.contourArea)
+        pts = main_cnt.reshape(-1, 2).astype(np.float32)
+        n_pts = len(pts)
+        if n_pts > 30:
+            sigma = min(15.0, max(4.0, n_pts / 120.0))
+            ksize = max(3, int(6 * sigma) | 1)
+            pad_n = ksize // 2
+            padded = np.concatenate([pts[-pad_n:], pts, pts[:pad_n]], axis=0)
+            kernel = cv2.getGaussianKernel(ksize, sigma).flatten()
+            sx = np.convolve(padded[:, 0], kernel, mode='valid')[:n_pts]
+            sy = np.convolve(padded[:, 1], kernel, mode='valid')[:n_pts]
+            sx = np.clip(sx, 0, w - 1)
+            sy = np.clip(sy, 0, h - 1)
+            smooth_cnt = (np.stack([sx, sy], axis=1)
+                          .astype(np.int32).reshape(-1, 1, 2))
+            smooth_mask = np.zeros_like(refined)
+            cv2.fillPoly(smooth_mask, [smooth_cnt], 255)
+            # Safety: don't shrink more than 30%
+            if np.count_nonzero(smooth_mask) >= np.count_nonzero(refined) * 0.70:
+                refined = smooth_mask
+
+    # Safety: revert if refinement bloated the mask beyond 2× original
+    if np.count_nonzero(refined) > max(orig_area * 2, h * w * 0.50):
         return mask
 
     return refined
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 8. DRAW RESULT
+# 10. DRAW RESULT
 # ──────────────────────────────────────────────────────────────────────────────
 
 def draw_result(gray_u8, refined_mask, scores,
@@ -521,6 +685,17 @@ def draw_result(gray_u8, refined_mask, scores,
 
     # ── Main result ───────────────────────────────────────────────────────────
     vis = cv2.cvtColor(gray_u8, cv2.COLOR_GRAY2BGR)
+
+    # Amber dilation ring — buffer zone around detected entrance
+    dil_r = max(5, int(min(h, w) * 0.025))
+    dil_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*dil_r+1, 2*dil_r+1))
+    dil_mask  = cv2.dilate(refined_mask, dil_k)
+    ring_mask = cv2.bitwise_and(dil_mask, cv2.bitwise_not(refined_mask))
+    ring_overlay = vis.copy()
+    ring_overlay[ring_mask > 0] = (30, 160, 255)   # amber (BGR)
+    cv2.addWeighted(ring_overlay, 0.28, vis, 0.72, 0, vis)
+
+    # Green cave entrance overlay
     overlay = vis.copy()
     overlay[refined_mask > 0] = (100, 210, 60)
     cv2.addWeighted(overlay, 0.35, vis, 0.65, 0, vis)
@@ -593,14 +768,14 @@ def draw_result(gray_u8, refined_mask, scores,
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 9. PROCESS ONE IMAGE
+# 11. PROCESS ONE IMAGE
 # ──────────────────────────────────────────────────────────────────────────────
 
 def process_image(input_path, output_dir):
     """Full pipeline for one image."""
     bn = os.path.splitext(os.path.basename(input_path))[0]
-    out_r = os.path.join(output_dir, f"{bn}_result.png")
-    out_m = os.path.join(output_dir, f"{bn}_mask.png")
+    out_r  = os.path.join(output_dir, f"{bn}_result.png")
+    out_m  = os.path.join(output_dir, f"{bn}_mask.png")
     out_dv = os.path.join(output_dir, f"{bn}_debug_valid.png")
     out_dc = os.path.join(output_dir, f"{bn}_debug_candidates.png")
 
@@ -608,8 +783,9 @@ def process_image(input_path, output_dir):
     h, w = gray_u8.shape
     print(f"  [{bn}] loaded {w}x{h}")
 
-    proc = preprocess_image(gray_u8, gray_f32)
+    proc      = preprocess_image(gray_u8, gray_f32)
     wmap, lc, rc, pn = compute_valid_region(gray_f32)
+    depth_map = compute_ir_depth(gray_f32)
     print(f"  [{bn}] valid cols {lc}–{rc} (of {w})")
 
     candidates = generate_candidates(proc, gray_f32, h, w, lc, rc)
@@ -623,101 +799,95 @@ def process_image(input_path, output_dir):
         return [out_r, out_m]
 
     best_mask, scores, all_sc = select_best_candidate(
-        candidates, gray_f32, wmap, lc, rc
+        candidates, gray_f32, wmap, lc, rc, depth_map=depth_map
     )
     print(f"  [{bn}] best score {scores['total']:.3f}  "
           f"area={scores['area_frac']*100:.1f}%  "
           f"add={scores['additive']:.2f}  "
           f"contrast={scores['contrast']:.2f}  "
-          f"enrich={scores['enrichment']:.2f}  "
+          f"texture={scores['texture']:.2f}(×{scores['texture_mult']:.2f})  "
+          f"ir_depth={scores['ir_depth']:.2f}  "
           f"depth={scores['depth']:.2f}  "
           f"area_m={scores['area_mult']:.2f}  "
           f"sol={scores['solidity']:.2f}(×{scores['sol_mult']:.2f})  "
-          f"in={scores['mean_inside']:.2f}  "
+          f"in={scores['mean_inside']:.2f}±{scores['texture']:.2f}  "
           f"out={scores['mean_outside']:.2f}")
 
-    # If the selected candidate has low solidity (non-convex, e.g. entrance
-    # merged with lateral shadow), split by valid-region weight: keep only
-    # the high-weight pixels (well-illuminated zone = actual entrance).
-    if scores.get("solidity", 1.0) < 0.55 and np.count_nonzero(best_mask) > 100:
+    # ── Solidity filter ───────────────────────────────────────────────────────
+    # Non-convex candidate (e.g. entrance merged with lateral IR shadow):
+    # keep only the well-illuminated weight-map portion.
+    if scores.get("solidity", 1.0) < 0.65 and np.count_nonzero(best_mask) > 100:
+        _is_dark_void = scores.get("mean_inside", 1.0) < 0.15
         mask_weights = wmap[best_mask > 0]
-        w_thresh = np.percentile(mask_weights, 60)
+        # Dark voids use 50th pct (gentler); others use 60th pct
+        w_thresh = np.percentile(mask_weights, 50 if _is_dark_void else 60)
         high_w = ((best_mask > 0) & (wmap >= w_thresh)).astype(np.uint8) * 255
-        # Clean and extract connected components
         sk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
         high_w = cv2.morphologyEx(high_w, cv2.MORPH_CLOSE, sk)
         high_w = cv2.morphologyEx(high_w, cv2.MORPH_OPEN, sk)
         n_hw, labels_hw, stats_hw, centroids_hw = cv2.connectedComponentsWithStats(
             high_w, 8)
         if n_hw > 1:
-            # Filter: keep only components whose centroid is within valid cols
             valid_comps = []
             for ci in range(1, n_hw):
-                cx_ci = centroids_hw[ci, 0]
+                cx_ci  = centroids_hw[ci, 0]
                 area_ci = stats_hw[ci, cv2.CC_STAT_AREA]
                 if lc <= cx_ci <= rc and area_ci >= np.count_nonzero(best_mask) * 0.10:
                     valid_comps.append((ci, area_ci))
             if valid_comps:
-                # Pick the largest valid component
                 best_ci = max(valid_comps, key=lambda x: x[1])[0]
-                candidate_hw = ((labels_hw == best_ci) * 255).astype(np.uint8)
-                best_mask = candidate_hw
+                best_mask = ((labels_hw == best_ci) * 255).astype(np.uint8)
             else:
-                # Fallback: just use largest
                 largest = 1 + np.argmax(stats_hw[1:, cv2.CC_STAT_AREA])
                 candidate_hw = ((labels_hw == largest) * 255).astype(np.uint8)
                 if np.count_nonzero(candidate_hw) >= np.count_nonzero(best_mask) * 0.15:
                     best_mask = candidate_hw
 
-    # ── Post-selection expansion ─────────────────────────────────────────────
-    # Grow the selected mask into connected dark pixels at a relaxed threshold.
-    # This captures the full cave entrance when the initial candidate only
-    # covers the darkest core (common for pit-style entrances).
+    # ── Post-selection expansion ──────────────────────────────────────────────
+    # Grow selected mask into connected dark pixels at a relaxed threshold.
+    # Captures the full entrance when the initial candidate covers only the core.
     best_area_frac = np.count_nonzero(best_mask) / (h * w)
     if best_area_frac < 0.25:
-        # Compute a relaxed dark threshold: use a higher percentile
         relax_pct = min(50, max(30, int(scores.get("area_frac", 0.1) * 100 * 4)))
         relax_thr = int(np.percentile(proc["denoised"], relax_pct))
         _, relax_dark = cv2.threshold(proc["denoised"], relax_thr, 255,
                                        cv2.THRESH_BINARY_INV)
-        # Bridge small gaps
         br_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
                                           (max(9, int(min(h,w)*0.02)|1),
                                            max(9, int(min(h,w)*0.02)|1)))
         relax_dark = cv2.morphologyEx(relax_dark, cv2.MORPH_CLOSE, br_k)
-        # Find connected component in relax_dark that overlaps with best_mask
-        n_rd, labels_rd, stats_rd, _ = cv2.connectedComponentsWithStats(
-            relax_dark, 8)
-        # Find which label(s) overlap the current best mask
+        n_rd, labels_rd, _, _ = cv2.connectedComponentsWithStats(relax_dark, 8)
         overlap_labels = set(np.unique(labels_rd[best_mask > 0])) - {0}
         if overlap_labels:
             expanded = np.zeros_like(best_mask)
             for lb in overlap_labels:
                 expanded[labels_rd == lb] = 255
-            exp_area_frac = np.count_nonzero(expanded) / (h * w)
-            # If valid region has significant lateral bounds, clip expanded
-            # mask to valid columns to prevent re-introducing lateral dark
+            # Clip to valid columns to prevent re-introducing lateral dark zones
             if lc > int(w * 0.05):
                 expanded[:, :lc] = 0
             if rc < int(w * 0.95):
                 expanded[:, rc+1:] = 0
-            # Keep largest connected component after clipping
             n_exp, labels_exp, stats_exp, _ = cv2.connectedComponentsWithStats(
                 expanded, 8)
             if n_exp > 1:
                 largest_exp = 1 + np.argmax(stats_exp[1:, cv2.CC_STAT_AREA])
                 expanded = ((labels_exp == largest_exp) * 255).astype(np.uint8)
-
             exp_area_frac = np.count_nonzero(expanded) / (h * w)
-            # Accept expansion if not too large and still reasonably dark
             if exp_area_frac <= 0.40 and exp_area_frac > best_area_frac * 0.8:
-                exp_mean = float(gray_f32[expanded > 0].mean())
+                exp_mean  = float(gray_f32[expanded > 0].mean())
                 orig_mean = float(gray_f32[best_mask > 0].mean())
-                # Accept if expanded version isn't drastically brighter
                 if exp_mean < orig_mean + 0.15:
-                    best_mask = expanded
-                    print(f"  [{bn}] expanded mask {best_area_frac*100:.1f}% → "
+                    print(f"  [{bn}] expanded {best_area_frac*100:.1f}% → "
                           f"{exp_area_frac*100:.1f}%")
+                    best_mask = expanded
+
+    # ── GrabCut boundary refinement ───────────────────────────────────────────
+    pre_gc = np.count_nonzero(best_mask) / (h * w)
+    gc_result = grabcut_refine(gray_u8, best_mask, expand_ratio=2.0)
+    post_gc = np.count_nonzero(gc_result) / (h * w)
+    if post_gc > 0:
+        print(f"  [{bn}] grabcut {pre_gc*100:.1f}% → {post_gc*100:.1f}%")
+        best_mask = gc_result
 
     refined = refine_mask(best_mask, gray_f32)
     draw_result(gray_u8, refined, scores,
@@ -725,6 +895,8 @@ def process_image(input_path, output_dir):
                 wmap, pn,
                 out_dc, candidates, all_sc)
 
+    final_area = np.count_nonzero(refined) / (h * w)
+    print(f"  [{bn}] final area {final_area*100:.1f}%")
     outputs = [out_r, out_m, out_dv, out_dc]
     for p in outputs:
         print(f"  [{bn}] saved: {os.path.basename(p)}")
@@ -732,14 +904,19 @@ def process_image(input_path, output_dir):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 10. MAIN
+# 12. MAIN
 # ──────────────────────────────────────────────────────────────────────────────
 
 def main():
-    if len(sys.argv) == 3:
-        process_image(sys.argv[1],
-                      os.path.dirname(sys.argv[2]) or ".")
+    if len(sys.argv) >= 2:
+        # One or more explicit image paths
+        for img_path in sys.argv[1:]:
+            out_dir = os.path.dirname(os.path.abspath(img_path)) or "."
+            print(f"Processing: {os.path.basename(img_path)}")
+            process_image(img_path, out_dir)
+            print()
     else:
+        # Batch mode: process all jpg/png in the script's directory
         cwd = os.path.dirname(os.path.abspath(__file__))
         patterns = ["*.jpg","*.jpeg","*.png","*.JPG","*.JPEG","*.PNG"]
         found = []
