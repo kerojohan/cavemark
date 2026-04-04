@@ -475,7 +475,7 @@ def compute_valid_region(gray_f32):
 # 4. GENERATE CANDIDATES
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _snap_lower_contour(mask, depth_norm, search_up=15, search_down=40,
+def _snap_lower_contour(mask, depth_norm, search_up=20, search_down=8,
                         smooth_window=25):
     """Snap the lower contour of mask to the strongest depth-gradient edge.
 
@@ -953,7 +953,11 @@ def score_candidate(mask, gray_f32, weight_map, left_col, right_col,
         texture_mult = max(0.35, 1.0 - 0.65 * (std_inside - 0.08) / 0.08)
     else:
         texture_mult = 0.35
-    if texture_mult < 1.0 and depth_model_score > 0.50:
+    if texture_mult < 1.0 and depth_model_score > 0.50 and contrast_score >= 0.65:
+        # Require decent contrast: a real cave entrance stands out from its
+        # surroundings. Low-contrast regions (floor, shadow) with high dm
+        # should NOT benefit from this bonus even if the depth model rates
+        # them as geometrically deep.
         dm_bonus = min(0.30, 0.30 * (depth_model_score - 0.50) / 0.50)
         texture_mult = min(1.0, texture_mult + dm_bonus)
 
@@ -1096,6 +1100,39 @@ def refine_mask(mask, gray_f32):
         largest = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
         refined = ((labels == largest) * 255).astype(np.uint8)
 
+    # Smooth contour to remove small notches and noise.
+    # Apply wrap-around Gaussian smoothing on the (x, y) contour point
+    # sequence, then redraw as a filled polygon.
+    # Sigma is capped at 15 to avoid over-smoothing large or complex masks
+    # (excessive smoothing can fold the contour and collapse the polygon).
+    cnts, _ = cv2.findContours(refined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if cnts:
+        cnt = max(cnts, key=cv2.contourArea)
+        pts = cnt[:, 0, :].astype(np.float64)   # shape (N, 2)
+        n_pts = len(pts)
+        if n_pts >= 20:
+            sigma = min(15.0, max(4.0, n_pts / 120.0))
+            radius = int(3 * sigma)
+            kx = np.arange(-radius, radius + 1, dtype=np.float64)
+            kernel = np.exp(-0.5 * (kx / sigma) ** 2)
+            kernel /= kernel.sum()
+            pad = len(kernel) // 2
+            # Wrap-around padding so the closed contour stays closed
+            px = np.concatenate([pts[-pad:, 0], pts[:, 0], pts[:pad, 0]])
+            py = np.concatenate([pts[-pad:, 1], pts[:, 1], pts[:pad, 1]])
+            sx = np.convolve(px, kernel, mode='valid')
+            sy = np.convolve(py, kernel, mode='valid')
+            # Clamp to image bounds so fillPoly doesn't get out-of-range coords
+            sx = np.clip(sx, 0, w - 1)
+            sy = np.clip(sy, 0, h - 1)
+            smoothed = np.stack([sx, sy], axis=1).astype(np.int32)
+            smooth_mask = np.zeros_like(refined)
+            cv2.fillPoly(smooth_mask, [smoothed], 255)
+            # Accept only if it didn't shrink the mask by more than 30%
+            sm_area = np.count_nonzero(smooth_mask)
+            if sm_area >= np.count_nonzero(refined) * 0.70:
+                refined = smooth_mask
+
     # Safety: if refinement bloated the mask beyond 2× original, revert
     refined_area = np.count_nonzero(refined)
     if refined_area > max(orig_area * 2, h * w * 0.50):
@@ -1115,15 +1152,20 @@ def grabcut_refine(best_mask, gray_u8, h, w):
     Strategy:
       - Pixels inside the mask → probable foreground (GC_PR_FGD)
       - Darkest pixels inside the mask → definite foreground (GC_FGD)
-      - Pixels outside the mask with brightness ≥ 65th-percentile → definite background (GC_BGD)
+      - Pixels outside the mask with brightness ≥ 75th-percentile → definite background (GC_BGD)
       - Everything else → probable background (GC_PR_BGD)
 
     GrabCut builds a per-pixel Gaussian Mixture Model of dark vs bright, then
     refines the boundary using graph-cuts (min-cut/max-flow), which naturally
     follows strong edges — ideal for the sharp cave-entrance boundary.
 
-    Safety: if GrabCut expands or shrinks the mask more than 3× / 0.2×,
-    the original mask is returned unchanged.
+    The expansion limit is 2.5× (was 1.1×) so that GrabCut can capture cave
+    interior areas that are lighter than the pure void (rocky floor/walls
+    visible inside the entrance) when the GMM supports it.
+
+    Safety: reject if result shrinks below 20% or expands beyond 250%.
+    If GrabCut fragments the result, keep only the component overlapping
+    the original seed.
     """
     if np.count_nonzero(best_mask) < 100:
         return best_mask
@@ -1139,8 +1181,6 @@ def grabcut_refine(best_mask, gray_u8, h, w):
     gc_mask[(best_mask > 0) & (gray_u8 <= thr_fg)] = cv2.GC_FGD
 
     # Definite BG: pixels outside the mask that are bright (top 25% of image).
-    # Using the 75th percentile keeps only clearly-lit regions as definite
-    # background, avoiding mis-labelling dark-but-not-cave areas.
     thr_bg = int(np.percentile(gray_u8, 75))
     gc_mask[(best_mask == 0) & (gray_u8 >= thr_bg)] = cv2.GC_BGD
 
@@ -1156,11 +1196,27 @@ def grabcut_refine(best_mask, gray_u8, h, w):
 
         orig_area = np.count_nonzero(best_mask)
         new_area  = np.count_nonzero(result)
-        # Safety bounds: GrabCut is used as a boundary-refiner, not a grower.
-        # Accept only if it shrinks or stays roughly the same size (max +10%).
-        # Larger expansions indicate GrabCut merged unrelated dark regions.
-        if new_area < orig_area * 0.20 or new_area > orig_area * 1.10:
+        # Reject if too small (collapsed) or unreasonably large.
+        # 2.5× allows capturing cave interior (rocky floor/walls) that are
+        # lighter than the pure void but part of the entrance.
+        if new_area < orig_area * 0.20 or new_area > orig_area * 2.50:
             return best_mask
+
+        # If GrabCut fragmented the result, keep only the LARGEST component that
+        # overlaps the original seed — avoids picking up disconnected dark patches.
+        # Use WithStats to get component areas so we can pick the biggest, not
+        # just the first (which may be a 1-pixel sliver at a component boundary).
+        n_comp, labels, stats, _ = cv2.connectedComponentsWithStats(result, 8)
+        if n_comp > 2:   # more than 1 foreground component
+            overlap_ids = np.unique(labels[best_mask > 0])
+            overlap_ids = overlap_ids[overlap_ids != 0]
+            if len(overlap_ids) > 0:
+                # Pick the largest component (by area) that overlaps the seed
+                keep_id = overlap_ids[
+                    np.argmax(stats[overlap_ids, cv2.CC_STAT_AREA])
+                ]
+                result = ((labels == keep_id) * 255).astype(np.uint8)
+
         return result
     except Exception:
         return best_mask
@@ -1179,6 +1235,16 @@ def draw_result(gray_u8, refined_mask, scores,
 
     # ── Main result ───────────────────────────────────────────────────────────
     vis = cv2.cvtColor(gray_u8, cv2.COLOR_GRAY2BGR)
+
+    # Dilation ring: semi-transparent buffer zone around the detected mask
+    dil_r = max(5, int(min(h, w) * 0.025))
+    dil_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*dil_r+1, 2*dil_r+1))
+    dil_mask = cv2.dilate(refined_mask, dil_k)
+    ring_mask = cv2.bitwise_and(dil_mask, cv2.bitwise_not(refined_mask))
+    ring_overlay = vis.copy()
+    ring_overlay[ring_mask > 0] = (30, 160, 255)   # amber ring
+    cv2.addWeighted(ring_overlay, 0.28, vis, 0.72, 0, vis)
+
     overlay = vis.copy()
     overlay[refined_mask > 0] = (100, 210, 60)
     cv2.addWeighted(overlay, 0.35, vis, 0.65, 0, vis)
@@ -1186,6 +1252,11 @@ def draw_result(gray_u8, refined_mask, scores,
     contours, _ = cv2.findContours(refined_mask, cv2.RETR_EXTERNAL,
                                     cv2.CHAIN_APPROX_SIMPLE)
     cv2.drawContours(vis, contours, -1, (0, 255, 80), 2)
+
+    # Outer dilation contour (dashed visual guide)
+    dil_contours, _ = cv2.findContours(dil_mask, cv2.RETR_EXTERNAL,
+                                        cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(vis, dil_contours, -1, (30, 160, 255), 1)
 
     score_val = scores.get("total", 0.0)
     label = f"cave entrance  score={score_val:.2f}"
@@ -1350,7 +1421,11 @@ def process_image(input_path, output_dir):
     # If the selected candidate has low solidity (non-convex, e.g. entrance
     # merged with lateral shadow), split by valid-region weight: keep only
     # the high-weight pixels (well-illuminated zone = actual entrance).
-    if scores.get("solidity", 1.0) < 0.65 and np.count_nonzero(best_mask) > 100:
+    # Skip this filter for true dark voids (mean_inside < 0.15): a very dark
+    # interior means this is a genuine cave entrance, not a shadow/border
+    # artefact, and over-filtering would collapse the mask.
+    _is_dark_void = scores.get("mean_inside", 1.0) < 0.15
+    if scores.get("solidity", 1.0) < 0.65 and np.count_nonzero(best_mask) > 100 and not _is_dark_void:
         mask_weights = wmap[best_mask > 0]
         w_thresh = np.percentile(mask_weights, 60)
         high_w = ((best_mask > 0) & (wmap >= w_thresh)).astype(np.uint8) * 255
