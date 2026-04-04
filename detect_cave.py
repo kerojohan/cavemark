@@ -1421,13 +1421,14 @@ def process_image(input_path, output_dir):
     # If the selected candidate has low solidity (non-convex, e.g. entrance
     # merged with lateral shadow), split by valid-region weight: keep only
     # the high-weight pixels (well-illuminated zone = actual entrance).
-    # Skip this filter for true dark voids (mean_inside < 0.15): a very dark
-    # interior means this is a genuine cave entrance, not a shadow/border
-    # artefact, and over-filtering would collapse the mask.
-    _is_dark_void = scores.get("mean_inside", 1.0) < 0.15
-    if scores.get("solidity", 1.0) < 0.65 and np.count_nonzero(best_mask) > 100 and not _is_dark_void:
+    # For very dark voids (mean_inside < 0.15) use a gentler percentile (30th)
+    # so that genuine cave voids that happen to be large aren't over-trimmed,
+    # while still removing the lateral IR-border artefact that causes low
+    # solidity (e.g. background.png left-edge dark zone merging with the slot).
+    if scores.get("solidity", 1.0) < 0.65 and np.count_nonzero(best_mask) > 100:
+        _is_dark_void = scores.get("mean_inside", 1.0) < 0.15
         mask_weights = wmap[best_mask > 0]
-        w_thresh = np.percentile(mask_weights, 60)
+        w_thresh = np.percentile(mask_weights, 30 if _is_dark_void else 60)
         high_w = ((best_mask > 0) & (wmap >= w_thresh)).astype(np.uint8) * 255
         # Clean and extract connected components
         sk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
