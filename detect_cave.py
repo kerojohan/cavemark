@@ -296,12 +296,14 @@ def estimate_depth_ensemble(gray_u8, gray_f32):
     ir_s  = cv2.GaussianBlur(ir_depth, (ks_ir, ks_ir), 0)
 
     # ── Base weighted average ─────────────────────────────────────────────────
-    # IR pseudo gets the highest weight: domain-specific physics signal.
-    # DA2 and MiDaS add ML-based geometry; entropy adds texture discrimination.
-    w_ir  = 0.45
+    # DA2 is now the primary signal: most reliable for caves with ambient light.
+    # IR pseudo-depth is useful when caves are pitch-black but fails when
+    # the cave interior has ambient illumination (then everything looks "near").
+    # MiDaS adds an independent geometry view; entropy adds uniformity info.
+    w_ir  = 0.22
     w_ent = 0.15
-    w_da2 = 0.28 if da2_s  is not None else 0.0
-    w_mid = 0.12 if mid_s  is not None else 0.0
+    w_da2 = 0.42 if da2_s  is not None else 0.0
+    w_mid = 0.21 if mid_s  is not None else 0.0
     total = w_ir + w_ent + w_da2 + w_mid
 
     ensemble = w_ir * ir_s + w_ent * ent_s
@@ -319,17 +321,20 @@ def estimate_depth_ensemble(gray_u8, gray_f32):
     gmm_depth = None
     try:
         from sklearn.mixture import GaussianMixture
-        # Subsample for speed: use every 4th pixel
-        ir_sub  = ir_s.flatten()[::4]
-        da2_sub = (da2_s if da2_s is not None else ensemble).flatten()[::4]
-        f = np.stack([ir_sub, da2_sub], axis=1).astype(np.float64)
+        # Subsample for speed: use every 4th pixel.
+        # Use DA2 + entropy as features: more reliable than IR when cave interior
+        # has ambient light (IR fails in those cases).
+        da2_feat = (da2_s if da2_s is not None else ensemble)
+        da2_sub  = da2_feat.flatten()[::4]
+        ent_sub  = ent_s.flatten()[::4]
+        f = np.stack([da2_sub, ent_sub], axis=1).astype(np.float64)
         gmm = GaussianMixture(n_components=2, max_iter=60, random_state=0)
         gmm.fit(f)
-        # Component with lowest mean ir_signal = deep (cave)
+        # Component with lowest mean DA2 depth = deepest (cave)
         cave_comp = int(np.argmin(gmm.means_[:, 0]))
         # Apply to full-resolution features
-        f_full = np.stack([ir_s.flatten(),
-                           (da2_s if da2_s is not None else ensemble).flatten()],
+        f_full = np.stack([da2_feat.flatten(),
+                           ent_s.flatten()],
                           axis=1).astype(np.float64)
         proba = gmm.predict_proba(f_full)
         gmm_depth = (1.0 - proba[:, cave_comp]).reshape(h, w).astype(np.float32)
@@ -817,12 +822,18 @@ def score_candidate(mask, gray_f32, weight_map, left_col, right_col,
     # Dark rock faces / vegetation show much higher interior std (0.10–0.20+).
     # This multiplicative gate directly penalises textured "dark but not cave"
     # regions that contrast_score and dark_score cannot distinguish alone.
+    # Exception: when the depth ensemble is confident this is a geometric void
+    # (depth_model_score > 0.50), soften the penalty — some cave entrances show
+    # interior wall texture due to ambient lighting yet are still real caves.
     if std_inside <= 0.08:
         texture_mult = 1.0
     elif std_inside <= 0.16:
         texture_mult = max(0.35, 1.0 - 0.65 * (std_inside - 0.08) / 0.08)
     else:
         texture_mult = 0.35
+    if texture_mult < 1.0 and depth_model_score > 0.50:
+        dm_bonus = min(0.30, 0.30 * (depth_model_score - 0.50) / 0.50)
+        texture_mult = min(1.0, texture_mult + dm_bonus)
 
     # Solidity gate: very non-convex (donut, tentacles) → penalised
     if solidity >= 0.45:
@@ -839,16 +850,16 @@ def score_candidate(mask, gray_f32, weight_map, left_col, right_col,
             lateral_pen = 0.4
 
     # Vertical position gate: cave entrances appear in the middle/lower portion
-    # of trail-camera frames.  Dark regions in the top 10–30% of the image are
+    # of trail-camera frames.  Dark regions in the top 40% of the image are
     # overwhelmingly camera-border vignette, sky, rock overhang, or vegetation —
     # never the cave entrance itself (cameras are placed at ground level looking
     # toward the cave).  Candidates whose centroid sits in the upper zone are
     # penalised multiplicatively so the correct lower-lying candidate wins.
     y_frac_c = cy / h
     if y_frac_c < 0.10:
-        vert_gate = 0.15
-    elif y_frac_c < 0.30:
-        vert_gate = 0.15 + 0.85 * (y_frac_c - 0.10) / 0.20
+        vert_gate = 0.10
+    elif y_frac_c < 0.40:
+        vert_gate = 0.10 + 0.90 * (y_frac_c - 0.10) / 0.30
     else:
         vert_gate = 1.0
 
@@ -862,7 +873,17 @@ def score_candidate(mask, gray_f32, weight_map, left_col, right_col,
     else:
         dark_gate = max(0.05, 0.35 - 0.30 * (mean_inside - 0.40) / 0.20)
 
-    total = additive * area_mult * solidity_mult * lateral_pen * dark_gate * texture_mult * vert_gate
+    # Depth model gate: when the ensemble strongly disagrees that this region is
+    # a cave void (depth_model_score < 0.35), apply a soft multiplicative penalty.
+    # This prevents high contrast/darkness scores from overriding a clear signal
+    # from DA2/MiDaS that the region is NOT geometrically deep.
+    # All correct cave detections have depth_model_score ≥ 0.40.
+    if depth_model_score >= 0.35:
+        dm_gate = 1.0
+    else:
+        dm_gate = 0.35 + 0.65 * (depth_model_score / 0.35)
+
+    total = additive * area_mult * solidity_mult * lateral_pen * dark_gate * texture_mult * vert_gate * dm_gate
 
     return {
         "total":            round(float(total), 4),
@@ -1420,17 +1441,43 @@ def process_image(input_path, output_dir):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def main():
-    if len(sys.argv) == 3:
-        process_image(sys.argv[1],
-                      os.path.dirname(sys.argv[2]) or ".")
+    suffixes = ("_result.png","_mask.png","_debug_valid.png",
+                "_debug_candidates.png","_debug_depth.png")
+
+    if len(sys.argv) == 3 and not os.path.isdir(sys.argv[2]):
+        # Legacy: detect_cave.py input.png output_dir/name.png
+        process_image(sys.argv[1], os.path.dirname(sys.argv[2]) or ".")
+    elif len(sys.argv) >= 2:
+        # One or more explicit input files
+        inputs = []
+        for arg in sys.argv[1:]:
+            p = os.path.abspath(arg)
+            if not any(os.path.basename(p).endswith(s) for s in suffixes):
+                inputs.append(p)
+        if not inputs:
+            print("No valid input images given.")
+            sys.exit(1)
+        print(f"Found {len(inputs)} input image(s):")
+        for p in inputs:
+            print(f"  {os.path.basename(p)}")
+        print()
+        all_out = []
+        for img in inputs:
+            out_dir = os.path.dirname(img)
+            print(f"Processing: {os.path.basename(img)}")
+            all_out += process_image(img, out_dir)
+            print()
+        print("─" * 60)
+        print(f"Done. {len(all_out)} output files:")
+        for p in all_out:
+            print(f"  {p}")
     else:
+        # Batch mode: all images in script directory
         cwd = os.path.dirname(os.path.abspath(__file__))
         patterns = ["*.jpg","*.jpeg","*.png","*.JPG","*.JPEG","*.PNG"]
         found = []
         for pat in patterns:
             found.extend(glob.glob(os.path.join(cwd, pat)))
-        suffixes = ("_result.png","_mask.png","_debug_valid.png",
-                    "_debug_candidates.png","_debug_depth.png")
         inputs = sorted(set(
             f for f in found
             if not any(os.path.basename(f).endswith(s) for s in suffixes)
