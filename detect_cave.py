@@ -1619,6 +1619,51 @@ def process_image(input_path, output_dir):
     if abs(post_gc_frac - pre_gc_frac) > 0.005:
         print(f"  [{bn}] grabcut {pre_gc_frac*100:.1f}% → {post_gc_frac*100:.1f}%")
 
+    # ── Depth-guided expansion ────────────────────────────────────────────────
+    # After GrabCut refines the dark void, include adjacent areas that the
+    # depth model rates as "deep" and are not brighter than the exterior.
+    # This recovers cave-interior rock/floor (lighter than the pure void but
+    # inside the entrance, e.g. bg8 rocky floor at depth_model=0.96).
+    # Only applied when depth_model_score ≥ 0.70 — low scores mean DA2 is
+    # uncertain; expansion would then risk growing into forest/shadow (bg1).
+    # Strategy:
+    #   1. Dilate best_mask by ~5% of min(h,w) to create a search annulus.
+    #   2. Within that annulus, accept pixels where:
+    #      - depth_norm ≥ 70% of the mask's mean depth (but ≥ 0.35 absolute)
+    #      - brightness < 80th-percentile of image (not bright exterior rock)
+    #   3. Keep only the connected component overlapping the original mask.
+    #   4. Accept only if expansion stays ≤ 2× the current mask size.
+    _dm_score = scores.get("depth_model", 0.0)
+    if depth_norm is not None and np.count_nonzero(best_mask) > 100 and _dm_score >= 0.70:
+        exp_r = max(7, int(min(h, w) * 0.05))
+        exp_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*exp_r+1, 2*exp_r+1))
+        search_zone = cv2.dilate(best_mask, exp_k)
+        annulus = cv2.bitwise_and(search_zone, cv2.bitwise_not(best_mask))
+
+        mean_d = float(depth_norm[best_mask > 0].mean())
+        depth_thr = max(0.35, mean_d * 0.70)
+        gray_thr  = int(np.percentile(gray_u8, 80))
+
+        deep_near = np.zeros_like(best_mask)
+        deep_near[(annulus > 0) & (depth_norm >= depth_thr) & (gray_u8 < gray_thr)] = 255
+        expanded = cv2.bitwise_or(best_mask, deep_near)
+
+        # Keep only the component overlapping the original seed
+        n_exp, labels_exp, stats_exp, _ = cv2.connectedComponentsWithStats(expanded, 8)
+        if n_exp > 2:
+            orig_ids = np.unique(labels_exp[best_mask > 0])
+            orig_ids = orig_ids[orig_ids != 0]
+            if len(orig_ids) > 0:
+                keep_id = orig_ids[np.argmax(stats_exp[orig_ids, cv2.CC_STAT_AREA])]
+                expanded = ((labels_exp == keep_id) * 255).astype(np.uint8)
+
+        exp_frac = np.count_nonzero(expanded) / (h * w)
+        cur_frac = np.count_nonzero(best_mask) / (h * w)
+        if cur_frac < exp_frac <= cur_frac * 2.0:
+            if exp_frac - cur_frac > 0.005:
+                print(f"  [{bn}] depth-expand {cur_frac*100:.1f}% → {exp_frac*100:.1f}%")
+            best_mask = expanded
+
     # ── Bottom contour snapping (bat_tracker-inspired) ────────────────────────
     # Snap the lower boundary of the mask to the strongest depth-gradient edge
     # using Sobel-Y analysis followed by moving-average smoothing.  This gives a
