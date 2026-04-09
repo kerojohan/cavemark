@@ -1,3 +1,16 @@
+---
+title: CaveMark
+emoji: 🕳️
+colorFrom: gray
+colorTo: green
+sdk: gradio
+sdk_version: 5.33.0
+app_file: app.py
+pinned: false
+license: mit
+short_description: Automatic cave entrance detector for IR/NIR imagery
+---
+
 # CaveMark
 
 Automatic cave entrance detector for IR/NIR monochrome imagery — no deep learning required.

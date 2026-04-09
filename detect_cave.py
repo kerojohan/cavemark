@@ -94,19 +94,19 @@ def compute_valid_region(gray_f32):
     profile_norm = profile_smooth / pmax
 
     drop_thresh = 0.45
-    left_col = 0
+    actual_left_col = 0
     for c in range(w):
         if profile_norm[c] >= drop_thresh:
-            left_col = c
+            actual_left_col = c
             break
-    right_col = w - 1
+    actual_right_col = w - 1
     for c in range(w - 1, -1, -1):
         if profile_norm[c] >= drop_thresh:
-            right_col = c
+            actual_right_col = c
             break
 
-    left_col  = min(left_col,  int(w * 0.30))
-    right_col = max(right_col, int(w * 0.70))
+    left_col  = min(actual_left_col,  int(w * 0.30))
+    right_col = max(actual_right_col, int(w * 0.70))
 
     # Soft weight map
     weight_row = np.ones(w, dtype=np.float32)
@@ -119,7 +119,7 @@ def compute_valid_region(gray_f32):
     weight_row = np.clip(weight_row, 0.0, 1.0)
 
     weight_map = np.tile(weight_row, (h, 1))
-    return weight_map, left_col, right_col, profile_norm
+    return weight_map, left_col, right_col, profile_norm, actual_left_col, actual_right_col
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -511,14 +511,18 @@ def select_best_candidate(candidates, gray_f32, weight_map,
 # 8. GRABCUT REFINE
 # ──────────────────────────────────────────────────────────────────────────────
 
-def grabcut_refine(gray_u8, mask, expand_ratio=2.0):
+def grabcut_refine(gray_u8, mask, conservative_mask=None, expand_ratio=2.5):
     """
     Refine mask boundary using GrabCut (OpenCV graph-cut, no extra deps).
 
-    Initialisation:
-      - Eroded core  → definite foreground
-      - Dilated mask → probable foreground
-      - Expanded rect area far from mask → probable background
+    If conservative_mask is provided (the pre-expansion baseline), it is used
+    as definite FG so GrabCut anchors on the known-good core and can include
+    additional dark interior pixels without over-trimming.
+
+    Without conservative_mask: eroded core is definite FG.
+    With conservative_mask: conservative_mask is definite FG; extra pixels in
+    mask become probable FG, letting GrabCut decide which dark interior areas
+    (e.g. cave floor below a rock band) are genuinely part of the entrance.
     """
     h, w = gray_u8.shape
     area = np.count_nonzero(mask)
@@ -552,11 +556,16 @@ def grabcut_refine(gray_u8, mask, expand_ratio=2.0):
     prob_fg[:, :x1] = 0;  prob_fg[:, x2:] = 0
     gc_mask[prob_fg > 0] = cv2.GC_PR_FGD
 
-    # Definite FG: eroded core
-    ero_r = max(3, int(min(bw, bh) * 0.08))
-    ero_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*ero_r+1, 2*ero_r+1))
-    core = cv2.erode(mask, ero_k)
-    gc_mask[core > 0] = cv2.GC_FGD
+    if conservative_mask is not None and np.count_nonzero(conservative_mask) >= 10:
+        # Definite FG: the pre-expansion mask (known-good entrance core)
+        gc_mask[conservative_mask > 0] = cv2.GC_FGD
+    else:
+        # Definite FG: eroded core of input mask
+        ero_r = max(3, int(min(bw, bh) * 0.08))
+        ero_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                           (2*ero_r+1, 2*ero_r+1))
+        core = cv2.erode(mask, ero_k)
+        gc_mask[core > 0] = cv2.GC_FGD
 
     # Probable BG: inside expanded rect but well away from mask
     far_r = max(7, int(min(bw, bh) * 0.20))
@@ -784,9 +793,9 @@ def process_image(input_path, output_dir):
     print(f"  [{bn}] loaded {w}x{h}")
 
     proc      = preprocess_image(gray_u8, gray_f32)
-    wmap, lc, rc, pn = compute_valid_region(gray_f32)
+    wmap, lc, rc, pn, actual_lc, actual_rc = compute_valid_region(gray_f32)
     depth_map = compute_ir_depth(gray_f32)
-    print(f"  [{bn}] valid cols {lc}–{rc} (of {w})")
+    print(f"  [{bn}] valid cols {lc}–{rc} (actual {actual_lc}–{actual_rc}, of {w})")
 
     candidates = generate_candidates(proc, gray_f32, h, w, lc, rc)
     print(f"  [{bn}] {len(candidates)} unique candidates")
@@ -845,45 +854,67 @@ def process_image(input_path, output_dir):
 
     # ── Post-selection expansion ──────────────────────────────────────────────
     # Grow selected mask into connected dark pixels at a relaxed threshold.
-    # Captures the full entrance when the initial candidate covers only the core.
+    # Uses a dilated seed (4% reach) so nearby dark components separated by
+    # a thin lighter band are bridged.
+    # pre_expansion_mask is saved for GrabCut's conservative-FG initialisation.
+    pre_expansion_mask = best_mask.copy()
     best_area_frac = np.count_nonzero(best_mask) / (h * w)
     if best_area_frac < 0.25:
-        relax_pct = min(50, max(30, int(scores.get("area_frac", 0.1) * 100 * 4)))
-        relax_thr = int(np.percentile(proc["denoised"], relax_pct))
+        orig_mean = float(gray_f32[best_mask > 0].mean())
+        br_size = max(9, int(min(h, w) * 0.02) | 1)
+        br_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (br_size, br_size))
+        reach_r = max(15, int(min(h, w) * 0.04))
+        reach_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                             (2*reach_r+1, 2*reach_r+1))
+
+        base_pct = min(50, max(30, int(scores.get("area_frac", 0.1) * 100 * 4)))
+        relax_thr = int(np.percentile(proc["denoised"], base_pct))
         _, relax_dark = cv2.threshold(proc["denoised"], relax_thr, 255,
                                        cv2.THRESH_BINARY_INV)
-        br_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
-                                          (max(9, int(min(h,w)*0.02)|1),
-                                           max(9, int(min(h,w)*0.02)|1)))
         relax_dark = cv2.morphologyEx(relax_dark, cv2.MORPH_CLOSE, br_k)
         n_rd, labels_rd, _, _ = cv2.connectedComponentsWithStats(relax_dark, 8)
-        overlap_labels = set(np.unique(labels_rd[best_mask > 0])) - {0}
+        seed_reach = cv2.dilate(best_mask, reach_k)
+        overlap_labels = set(np.unique(labels_rd[seed_reach > 0])) - {0}
         if overlap_labels:
             expanded = np.zeros_like(best_mask)
             for lb in overlap_labels:
                 expanded[labels_rd == lb] = 255
-            # Clip to valid columns to prevent re-introducing lateral dark zones
-            if lc > int(w * 0.05):
-                expanded[:, :lc] = 0
-            if rc < int(w * 0.95):
-                expanded[:, rc+1:] = 0
+            # When the profile doesn't rise until well past the capped lc,
+            # there is a significant lateral zone → clip at the actual rise
+            # column to prevent the expansion from leaking into it.
+            clip_lc = actual_lc if actual_lc > lc else lc
+            clip_rc = actual_rc if actual_rc < rc else rc
+            if clip_lc > int(w * 0.05):
+                expanded[:, :clip_lc] = 0
+            if clip_rc < int(w * 0.95):
+                expanded[:, clip_rc+1:] = 0
             n_exp, labels_exp, stats_exp, _ = cv2.connectedComponentsWithStats(
                 expanded, 8)
             if n_exp > 1:
                 largest_exp = 1 + np.argmax(stats_exp[1:, cv2.CC_STAT_AREA])
                 expanded = ((labels_exp == largest_exp) * 255).astype(np.uint8)
             exp_area_frac = np.count_nonzero(expanded) / (h * w)
-            if exp_area_frac <= 0.40 and exp_area_frac > best_area_frac * 0.8:
-                exp_mean  = float(gray_f32[expanded > 0].mean())
-                orig_mean = float(gray_f32[best_mask > 0].mean())
-                if exp_mean < orig_mean + 0.15:
-                    print(f"  [{bn}] expanded {best_area_frac*100:.1f}% → "
-                          f"{exp_area_frac*100:.1f}%")
-                    best_mask = expanded
+            exp_mean = float(gray_f32[expanded > 0].mean())
+            if (exp_area_frac <= 0.40
+                    and exp_area_frac > best_area_frac * 0.8
+                    and exp_mean < orig_mean + 0.15):
+                print(f"  [{bn}] expanded {best_area_frac*100:.1f}% → "
+                      f"{exp_area_frac*100:.1f}%")
+                best_mask = expanded
+                best_area_frac = exp_area_frac
 
     # ── GrabCut boundary refinement ───────────────────────────────────────────
+    # Pass pre_expansion_mask as conservative FG when the mask has grown
+    # significantly — this anchors the definite-FG model on the clean core
+    # and lets GrabCut decide whether to include the dark interior or not.
     pre_gc = np.count_nonzero(best_mask) / (h * w)
-    gc_result = grabcut_refine(gray_u8, best_mask, expand_ratio=2.0)
+    pre_exp_frac = np.count_nonzero(pre_expansion_mask) / (h * w)
+    use_conservative = (pre_gc > pre_exp_frac * 1.3)
+    gc_result = grabcut_refine(
+        gray_u8, best_mask,
+        conservative_mask=pre_expansion_mask if use_conservative else None,
+        expand_ratio=2.5
+    )
     post_gc = np.count_nonzero(gc_result) / (h * w)
     if post_gc > 0:
         print(f"  [{bn}] grabcut {pre_gc*100:.1f}% → {post_gc*100:.1f}%")
