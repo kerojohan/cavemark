@@ -458,8 +458,25 @@ def score_candidate(mask, gray_f32, weight_map, left_col, right_col,
         if valid_score < 0.5:
             lateral_pen = 0.4
 
+    # Border contact penalty: true cave entrances are contained within the frame.
+    # Dark patches that bleed to an image edge are likely cast shadows or vegetation
+    # extending beyond the visible area, not a cave void.
+    bp = 3  # border margin in pixels
+    border_touches = int(
+        (mask[:bp, :] > 0).any()       # top
+        + (mask[-bp:, :] > 0).any()    # bottom
+        + (mask[:, :bp] > 0).any()     # left
+        + (mask[:, -bp:] > 0).any()    # right
+    )
+    if border_touches == 0:
+        border_mult = 1.0
+    elif border_touches == 1:
+        border_mult = 0.60
+    else:
+        border_mult = 0.35
+
     total = (additive * area_mult * solidity_mult
-             * texture_mult * vert_gate * lateral_pen)
+             * texture_mult * vert_gate * lateral_pen * border_mult)
 
     return {
         "total":          round(float(total), 4),
@@ -480,6 +497,8 @@ def score_candidate(mask, gray_f32, weight_map, left_col, right_col,
         "valid_score":    round(float(valid_score), 3),
         "mean_inside":    round(float(mean_inside), 3),
         "mean_outside":   round(float(mean_outside), 3),
+        "border_touches": border_touches,
+        "border_mult":    round(float(border_mult), 3),
     }
 
 
@@ -810,6 +829,7 @@ def process_image(input_path, output_dir):
           f"depth={scores['depth']:.2f}  "
           f"area_m={scores['area_mult']:.2f}  "
           f"sol={scores['solidity']:.2f}(×{scores['sol_mult']:.2f})  "
+          f"border={scores['border_touches']}(×{scores['border_mult']:.2f})  "
           f"in={scores['mean_inside']:.2f}±{scores['texture']:.2f}  "
           f"out={scores['mean_outside']:.2f}")
 
@@ -876,7 +896,16 @@ def process_image(input_path, output_dir):
             if exp_area_frac <= 0.40 and exp_area_frac > best_area_frac * 0.8:
                 exp_mean  = float(gray_f32[expanded > 0].mean())
                 orig_mean = float(gray_f32[best_mask > 0].mean())
-                if exp_mean < orig_mean + 0.15:
+                # Reject expansion if centroid drifted far — guards against
+                # bridging to a disconnected dark zone (e.g. vegetation corner).
+                orig_pts = np.argwhere(best_mask > 0).astype(np.float32)
+                exp_pts  = np.argwhere(expanded > 0).astype(np.float32)
+                orig_cy_m, orig_cx_m = orig_pts.mean(axis=0)
+                exp_cy_m,  exp_cx_m  = exp_pts.mean(axis=0)
+                centroid_shift = (np.sqrt((exp_cx_m - orig_cx_m)**2
+                                         + (exp_cy_m - orig_cy_m)**2)
+                                  / min(h, w))
+                if exp_mean < orig_mean + 0.15 and centroid_shift <= 0.20:
                     print(f"  [{bn}] expanded {best_area_frac*100:.1f}% → "
                           f"{exp_area_frac*100:.1f}%")
                     best_mask = expanded
@@ -890,6 +919,15 @@ def process_image(input_path, output_dir):
         best_mask = gc_result
 
     refined = refine_mask(best_mask, gray_f32)
+
+    # Hard-clip final mask to valid illumination columns.
+    # Removes penumbra/vignetting zones from the result even when the initial
+    # candidate or GrabCut extended into them.
+    if lc > int(w * 0.05):
+        refined[:, :lc] = 0
+    if rc < int(w * 0.95):
+        refined[:, rc + 1:] = 0
+
     draw_result(gray_u8, refined, scores,
                 out_r, out_m, out_dv,
                 wmap, pn,
