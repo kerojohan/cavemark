@@ -874,67 +874,54 @@ def process_image(input_path, output_dir):
 
     # ── Post-selection expansion ──────────────────────────────────────────────
     # Grow selected mask into connected dark pixels at a relaxed threshold.
-    # Uses a dilated seed (4% reach) so nearby dark components separated by
-    # a thin lighter band are bridged.
-    # pre_expansion_mask is saved for GrabCut's conservative-FG initialisation.
-    pre_expansion_mask = best_mask.copy()
+    # Captures the full entrance when the initial candidate covers only the core.
     best_area_frac = np.count_nonzero(best_mask) / (h * w)
     if best_area_frac < 0.25:
-        orig_mean = float(gray_f32[best_mask > 0].mean())
-        br_size = max(9, int(min(h, w) * 0.02) | 1)
-        br_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (br_size, br_size))
-        reach_r = max(15, int(min(h, w) * 0.04))
-        reach_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
-                                             (2*reach_r+1, 2*reach_r+1))
-
-        base_pct = min(50, max(30, int(scores.get("area_frac", 0.1) * 100 * 4)))
-        relax_thr = int(np.percentile(proc["denoised"], base_pct))
+        relax_pct = min(50, max(30, int(scores.get("area_frac", 0.1) * 100 * 4)))
+        relax_thr = int(np.percentile(proc["denoised"], relax_pct))
         _, relax_dark = cv2.threshold(proc["denoised"], relax_thr, 255,
                                        cv2.THRESH_BINARY_INV)
+        br_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                          (max(9, int(min(h,w)*0.02)|1),
+                                           max(9, int(min(h,w)*0.02)|1)))
         relax_dark = cv2.morphologyEx(relax_dark, cv2.MORPH_CLOSE, br_k)
         n_rd, labels_rd, _, _ = cv2.connectedComponentsWithStats(relax_dark, 8)
-        seed_reach = cv2.dilate(best_mask, reach_k)
-        overlap_labels = set(np.unique(labels_rd[seed_reach > 0])) - {0}
+        overlap_labels = set(np.unique(labels_rd[best_mask > 0])) - {0}
         if overlap_labels:
             expanded = np.zeros_like(best_mask)
             for lb in overlap_labels:
                 expanded[labels_rd == lb] = 255
-            # When the profile doesn't rise until well past the capped lc,
-            # there is a significant lateral zone → clip at the actual rise
-            # column to prevent the expansion from leaking into it.
-            clip_lc = actual_lc if actual_lc > lc else lc
-            clip_rc = actual_rc if actual_rc < rc else rc
-            if clip_lc > int(w * 0.05):
-                expanded[:, :clip_lc] = 0
-            if clip_rc < int(w * 0.95):
-                expanded[:, clip_rc+1:] = 0
+            # Clip to valid columns to prevent re-introducing lateral dark zones
+            if lc > int(w * 0.05):
+                expanded[:, :lc] = 0
+            if rc < int(w * 0.95):
+                expanded[:, rc+1:] = 0
             n_exp, labels_exp, stats_exp, _ = cv2.connectedComponentsWithStats(
                 expanded, 8)
             if n_exp > 1:
                 largest_exp = 1 + np.argmax(stats_exp[1:, cv2.CC_STAT_AREA])
                 expanded = ((labels_exp == largest_exp) * 255).astype(np.uint8)
             exp_area_frac = np.count_nonzero(expanded) / (h * w)
-            exp_mean = float(gray_f32[expanded > 0].mean())
-            if (exp_area_frac <= 0.40
-                    and exp_area_frac > best_area_frac * 0.8
-                    and exp_mean < orig_mean + 0.15):
-                print(f"  [{bn}] expanded {best_area_frac*100:.1f}% → "
-                      f"{exp_area_frac*100:.1f}%")
-                best_mask = expanded
-                best_area_frac = exp_area_frac
+            if exp_area_frac <= 0.40 and exp_area_frac > best_area_frac * 0.8:
+                exp_mean  = float(gray_f32[expanded > 0].mean())
+                orig_mean = float(gray_f32[best_mask > 0].mean())
+                # Reject expansion if centroid drifted far — guards against
+                # bridging to a disconnected dark zone (e.g. vegetation corner).
+                orig_pts = np.argwhere(best_mask > 0).astype(np.float32)
+                exp_pts  = np.argwhere(expanded > 0).astype(np.float32)
+                orig_cy_m, orig_cx_m = orig_pts.mean(axis=0)
+                exp_cy_m,  exp_cx_m  = exp_pts.mean(axis=0)
+                centroid_shift = (np.sqrt((exp_cx_m - orig_cx_m)**2
+                                         + (exp_cy_m - orig_cy_m)**2)
+                                  / min(h, w))
+                if exp_mean < orig_mean + 0.15 and centroid_shift <= 0.20:
+                    print(f"  [{bn}] expanded {best_area_frac*100:.1f}% → "
+                          f"{exp_area_frac*100:.1f}%")
+                    best_mask = expanded
 
     # ── GrabCut boundary refinement ───────────────────────────────────────────
-    # Pass pre_expansion_mask as conservative FG when the mask has grown
-    # significantly — this anchors the definite-FG model on the clean core
-    # and lets GrabCut decide whether to include the dark interior or not.
     pre_gc = np.count_nonzero(best_mask) / (h * w)
-    pre_exp_frac = np.count_nonzero(pre_expansion_mask) / (h * w)
-    use_conservative = (pre_gc > pre_exp_frac * 1.3)
-    gc_result = grabcut_refine(
-        gray_u8, best_mask,
-        conservative_mask=pre_expansion_mask if use_conservative else None,
-        expand_ratio=2.5
-    )
+    gc_result = grabcut_refine(gray_u8, best_mask, expand_ratio=2.0)
     post_gc = np.count_nonzero(gc_result) / (h * w)
     if post_gc > 0:
         print(f"  [{bn}] grabcut {pre_gc*100:.1f}% → {post_gc*100:.1f}%")
@@ -942,13 +929,13 @@ def process_image(input_path, output_dir):
 
     refined = refine_mask(best_mask, gray_f32)
 
-    # Hard-clip final mask to the actual illumination columns (not the capped
-    # lc/rc) to exclude IR vignette/penumbra that GrabCut or contour smoothing
-    # may have reintroduced after the expansion clip.
-    if actual_lc > int(w * 0.05):
-        refined[:, :actual_lc] = 0
-    if actual_rc < int(w * 0.95):
-        refined[:, actual_rc + 1:] = 0
+    # Hard-clip final mask to valid illumination columns.
+    # Removes penumbra/vignetting zones from the result even when the initial
+    # candidate or GrabCut extended into them.
+    if lc > int(w * 0.05):
+        refined[:, :lc] = 0
+    if rc < int(w * 0.95):
+        refined[:, rc + 1:] = 0
 
     draw_result(gray_u8, refined, scores,
                 out_r, out_m, out_dv,
